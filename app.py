@@ -218,6 +218,10 @@ def ask_fitness_ai(question, history, workouts):
     endpoint=str(setting("AI_CHAT_URL", "")).strip()
     token=str(setting("AI_API_KEY", "")).strip()
     model=str(setting("AI_MODEL", "")).strip()
+    # Accept a service base URL as well as the complete chat endpoint.
+    endpoint=endpoint.rstrip("/")
+    if endpoint.endswith("/v1"):
+        endpoint+="/chat/completions"
     if not endpoint.startswith("https://") or not token or not model:
         raise ValueError("설정에서 AI 연결 안내를 확인해 주세요.")
     # Send only the selected member's recent numeric exercise log, never photos or names.
@@ -243,8 +247,19 @@ def ask_fitness_ai(question, history, workouts):
         if not isinstance(answer,str) or not answer.strip():
             raise ValueError("AI가 빈 답변을 반환했어요. 다시 질문해 주세요.")
         return answer
-    except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError):
-        raise ValueError("AI 연결에 실패했어요. 연결 설정을 확인하거나 잠시 후 다시 시도해 주세요.") from None
+    except urllib.error.HTTPError as exc:
+        explanations={
+            400:"요청 형식 또는 모델 설정이 맞지 않아요. 해당 모델이 채팅 API를 지원하는지 확인해 주세요.",
+            401:"AI 인증에 실패했어요. 배포 설정의 API 키를 확인해 주세요.",
+            403:"이 AI 모델을 사용할 권한이 없어요. 계정의 모델 접근 권한을 확인해 주세요.",
+            404:"AI 주소 또는 모델 이름을 찾지 못했어요. 전체 채팅 API 주소와 모델 이름을 확인해 주세요.",
+            429:"요청 한도 또는 사용 가능 잔액을 확인해야 해요. 잠시 후 재시도하거나 AI 계정 상태를 확인해 주세요.",
+        }
+        raise ValueError(explanations.get(exc.code,"AI 서비스에 문제가 있어요. 잠시 후 다시 시도해 주세요.")+f" (HTTP {exc.code})") from None
+    except (TimeoutError, urllib.error.URLError):
+        raise ValueError("AI 서버에 연결하지 못했거나 응답 시간이 초과됐어요. 잠시 후 다시 시도해 주세요.") from None
+    except (KeyError, IndexError, TypeError, AttributeError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("AI 응답 형식이 맞지 않아요. messages 요청과 choices 응답을 지원하는 채팅 API인지 확인해 주세요.") from None
 
 
 def main():
@@ -584,7 +599,8 @@ def main():
         else:
             photo=st.file_uploader("사진 선택 · 5MB 이하",type=["jpg","jpeg","png"],key="upload_"+token)
         st.caption("가족에게 공유돼요. 얼굴·위치 노출에 주의하세요.")
-        if st.button("기록 저장",type="primary",disabled=photo is None):
+        photo_actions=st.columns(2)
+        if photo_actions[0].button("기록 저장",type="primary",disabled=photo is None,use_container_width=True):
             try:
                 write_workout(db,str(uuid4()),me,d["day"],d["sport"],d["minutes"],d["category"],d["effort"],normalized_photo(photo))
                 st.session_state.saved_day=d["day"]
@@ -593,19 +609,59 @@ def main():
                 go("완료")
             except (ValueError,sqlite3.Error) as exc:
                 st.error(str(exc))
-        if st.button("← 시간 수정"):
+        if photo_actions[1].button("← 시간 수정",use_container_width=True):
             go("시간입력")
     elif page=="완료":
-        st.subheader("✅ 오늘의 움직임, 저장 완료!")
+        st.subheader("🎉 오늘도 수고했어요!")
+        st.caption("운동 기록과 사진을 저장했어요. 잠시 쉬면서 회복해요.")
         st.write(st.session_state.get("saved_summary",""))
         if st.button("홈으로",type="primary"):
             go("홈")
         if st.button("방금 기록 보기"):
             st.session_state.calendar_day=st.session_state.get("saved_day",today)
+            st.session_state.calendar_month=st.session_state.calendar_day.replace(day=1)
             go("달력")
     elif page=="달력":
-        st.subheader("📅 운동 달력")
-        selected=st.date_input("보고 싶은 날짜",key="calendar_day",value=today,max_value=today)
+        import calendar
+        st.subheader("운동 달력")
+        selected=st.session_state.get("calendar_day",today)
+        if not isinstance(selected,date):
+            selected=today
+        month=st.session_state.get("calendar_month",selected.replace(day=1))
+        controls=st.columns([1,4,1])
+        if controls[0].button("‹",key="month_prev",help="이전 달",use_container_width=True):
+            st.session_state.calendar_month=(month-timedelta(days=1)).replace(day=1)
+            st.rerun()
+        controls[1].markdown(f"<div style='text-align:center;font-size:21px;font-weight:700;color:#191F28'>{month.year}년 {month.month}월</div>",unsafe_allow_html=True)
+        if controls[2].button("›",key="month_next",help="다음 달",use_container_width=True):
+            st.session_state.calendar_month=(month.replace(day=28)+timedelta(days=4)).replace(day=1)
+            st.rerun()
+        if st.button("오늘",key="calendar_today"):
+            st.session_state.calendar_day=today
+            st.session_state.calendar_month=today.replace(day=1)
+            st.rerun()
+        marked=set(mine.day.tolist())
+        headers=st.columns(7,gap="small")
+        for column,label in zip(headers,["일","월","화","수","목","금","토"]):
+            column.markdown(f"<div style='text-align:center;font-size:12px;color:#697586'>{label}</div>",unsafe_allow_html=True)
+        st.html("""<style>
+        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(7)){flex-wrap:nowrap!important;gap:3px!important;}
+        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(7)) > [data-testid="stColumn"]{min-width:0!important;flex:1 1 0!important;width:calc(100% / 7)!important;}
+        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(7)) button{padding:3px!important;min-height:42px!important;border-radius:8px!important;}
+        </style>""")
+        for week in calendar.Calendar(firstweekday=6).monthdayscalendar(month.year,month.month):
+            columns=st.columns(7,gap="small")
+            for column,num in zip(columns,week):
+                if not num:
+                    column.write("")
+                    continue
+                day=date(month.year,month.month,num)
+                label=str(num)+(" ·" if str(day) in marked else "")
+                if column.button(label,key=f"day_{day}",type="primary" if day==selected else "secondary",use_container_width=True,help=f"{day} 운동 기록",disabled=day>today):
+                    st.session_state.calendar_day=day
+                    st.rerun()
+        st.caption("· 운동한 날")
+        st.divider()
         daily=mine[mine.day==str(selected)]
         st.caption(f"{selected:%Y.%m.%d} · {len(daily)}회 · {int(daily.minutes.sum())}분")
         if daily.empty:
@@ -618,7 +674,7 @@ def main():
             with connect_db(db) as conn:
                 image=conn.execute("SELECT photo FROM workouts WHERE id=? AND member=?",(rid,me)).fetchone()
             if image and image[0]:
-                st.image(image[0],width=240)
+                st.image(image[0],use_container_width=True)
             else:
                 st.caption("인증사진 없음 · 이전 기록")
             if st.button("수정 · 삭제"):
@@ -690,6 +746,12 @@ def main():
                     st.write(message["content"])
             st.caption("질문과 내 최근 운동 기록이 AI 서비스에 전송돼요. 이름·사진은 보내지 않으며 의료정보는 입력하지 마세요. 답변은 참고용입니다.")
             question=st.chat_input("운동 목표나 궁금한 점을 물어보세요",disabled=not connected)
+            retry_key="ai_retry_"+str(me)
+            pending=st.session_state.get(retry_key, "")
+            if pending:
+                st.caption("보내지 못한 질문: "+pending)
+                if st.button("다시 보내기",key="retry_ai"):
+                    question=pending
             if question:
                 if len(question)>2000:
                     st.warning("질문은 2,000자 이내로 작성해 주세요.")
@@ -697,10 +759,15 @@ def main():
                     try:
                         with st.spinner("내 기록을 살펴보고 있어요…"):
                             answer=ask_fitness_ai(question,st.session_state[thread_key],recent)
+                        st.session_state.pop(retry_key,None)
                         st.session_state[thread_key].extend([{"role":"user","content":question},{"role":"assistant","content":answer}])
                         st.rerun()
                     except ValueError as exc:
-                        st.error(str(exc))
+                        st.session_state[retry_key]=question
+                        st.warning(str(exc))
+                        st.caption("질문은 보관했어요. 다시 보내려면 아래 버튼을 눌러 주세요.")
+                        if st.button("질문 보관 · 재시도 준비",key="prepare_retry"):
+                            st.rerun()
             if st.session_state[thread_key] and st.button("대화 지우기"):
                 st.session_state[thread_key]=[]
                 st.rerun()
